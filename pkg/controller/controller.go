@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
 	"log"
 	"reflect"
 	"time"
@@ -14,8 +16,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
 )
 
 func ignoreNotFound(err error) error {
@@ -37,6 +41,12 @@ const (
 	jobDeletedMetric       = "jobs_deleted_total"
 )
 
+// CNIConfig for access cni ipmi to release ip resource
+type CNIConfig struct {
+	cniType  string
+	paras    map[string]string
+}
+
 // Kleaner watches the kubernetes api for changes to Pods and Jobs and
 // delete those according to configured timeouts
 type Kleaner struct {
@@ -57,6 +67,11 @@ type Kleaner struct {
 	dryRun bool
 	ctx    context.Context
 	stopCh <-chan struct{}
+
+	taintEvictionQueue *TimedWorkerQueue
+	recorder              record.EventRecorder
+	cniConfig             CNIConfig
+	allowCSIDrivers       []string
 }
 
 // NewKleaner creates a new NewKleaner
@@ -95,6 +110,15 @@ func NewKleaner(ctx context.Context, kclient *kubernetes.Clientset, namespace st
 		resyncPeriod,
 		cache.Indexers{},
 	)
+	// Create informer for watching node
+	factory := informers.NewSharedInformerFactory(kclient, resyncPeriod)
+	nodeInformer := factory.Core().V1().Nodes().Informer()
+	// start informer
+	go factory.Start(stopCh)
+
+	eventBroadcaster := record.NewBroadcaster()
+	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "cleanup-controller"})
+
 	kleaner := &Kleaner{
 		dryRun:                dryRun,
 		kclient:               kclient,
@@ -107,6 +131,7 @@ func NewKleaner(ctx context.Context, kclient *kubernetes.Clientset, namespace st
 		deleteEvictedAfter:    deleteEvictedAfter,
 		ignoreOwnedByCronjob:  ignoreOwnedByCronjob,
 		labelSelector:         labelSelector,
+		recorder:              recorder,
 	}
 	jobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(old, new interface{}) {
@@ -123,11 +148,43 @@ func NewKleaner(ctx context.Context, kclient *kubernetes.Clientset, namespace st
 		},
 	})
 
+	// start to sync and call list
+	if !cache.WaitForCacheSync(stopCh, nodeInformer.HasSynced) {
+		log.Fatal("Timed out waiting for caches to sync")
+	}
+
+	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: func(old, new interface{}) {
+			if reflect.DeepEqual(old, new) {
+				return
+			}
+			newNode := new.(*corev1.Node)
+			oldNode := old.(*corev1.Node)
+			if diffNodeStatusReady(oldNode, newNode) {
+				kleaner.Process(new)
+			}
+		}})
+
 	kleaner.podInformer = podInformer
 	kleaner.jobInformer = jobInformer
 
+	kleaner.taintEvictionQueue = CreateWorkerQueue(deletePodHandler(c, tm.emitPodDeletionEvent))
+
 	return kleaner
 }
+
+func (c *Kleaner) emitPodDeletionEvent(nsName types.NamespacedName) {
+	if c.recorder == nil {
+		return
+	}
+	ref := &corev1.ObjectReference{
+		Kind:      "Pod",
+		Name:      nsName.Name,
+		Namespace: nsName.Namespace,
+	}
+	c.recorder.Eventf(ref, corev1.EventTypeNormal, "TaintManagerEviction", "Marking for deletion Pod %s", nsName.String())
+}
+
 
 func (c *Kleaner) periodicCacheCheck() {
 	ticker := time.NewTicker(2 * resyncPeriod)
@@ -181,8 +238,19 @@ func (c *Kleaner) Process(obj interface{}) {
 		}
 		// normal cleanup flow
 		if shouldDeletePod(t, c.deleteOrphanedAfter, c.deletePendingAfter, c.deleteEvictedAfter, c.deleteSuccessfulAfter, c.deleteFailedAfter) {
-			c.DeletePod(t)
+			c.DeletePod(t, false)
 		}
+	case *corev1.Node:
+		node := t
+		// skip nodes that are already in the deleting process
+		if !node.DeletionTimestamp.IsZero() {
+			return
+		}
+		// normal cleanup flow
+		if shouldCleanupNode(t) {
+			c.CleanupNode(t)
+		}
+
 	}
 }
 
@@ -202,17 +270,36 @@ func (c *Kleaner) DeleteJob(job *batchv1.Job) {
 	metrics.GetOrCreateCounter(metricName(jobDeletedMetric, job.Namespace)).Inc()
 }
 
-func (c *Kleaner) DeletePod(pod *corev1.Pod) {
+func (c *Kleaner) DeletePod(pod *corev1.Pod, isForce bool) {
 	if c.dryRun {
 		log.Printf("dry-run: Pod '%s:%s' would have been deleted", pod.Namespace, pod.Name)
 		return
 	}
 	log.Printf("Deleting pod '%s/%s'", pod.Namespace, pod.Name)
 	var po metav1.DeleteOptions
+	if isForce {
+		po.GracePeriodSeconds = new(int64)
+
+		// TODO: force release pod and attachment pvc and cni
+	}
+
+
 	if err := c.kclient.CoreV1().Pods(pod.Namespace).Delete(c.ctx, pod.Name, po); ignoreNotFound(err) != nil {
 		log.Printf("failed to delete pod '%s:%s': %v", pod.Namespace, pod.Name, err)
 		metrics.GetOrCreateCounter(metricName(podDeletedFailedMetric, pod.Namespace)).Inc()
 		return
 	}
 	metrics.GetOrCreateCounter(metricName(podDeletedMetric, pod.Namespace)).Inc()
+}
+
+
+func (c *Kleaner) CleanupNode(node *corev1.Node) {
+	if c.dryRun {
+		log.Printf("dry-run: Node %s would have been cleanup", node.Name)
+		return
+	}
+
+	// get all pod -> filter pods -> add pods to
+
+
 }

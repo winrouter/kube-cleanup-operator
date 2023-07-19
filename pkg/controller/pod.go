@@ -107,3 +107,24 @@ func podFinishTime(podObj *corev1.Pod) time.Time {
 	}
 	return time.Time{}
 }
+
+
+func deletePodHandler(c clientset.Interface, emitEventFunc func(types.NamespacedName)) func(ctx context.Context, args *WorkArgs) error {
+	return func(ctx context.Context, args *WorkArgs) error {
+		ns := args.NamespacedName.Namespace
+		name := args.NamespacedName.Name
+		klog.FromContext(ctx).Info("NoExecuteTaintManager is deleting pod", "pod", args.NamespacedName.String())
+		if emitEventFunc != nil {
+			emitEventFunc(args.NamespacedName)
+		}
+		var err error
+		for i := 0; i < retries; i++ {
+			err = addConditionAndDeletePod(ctx, c, name, ns)
+			if err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return err
+	}
+}
