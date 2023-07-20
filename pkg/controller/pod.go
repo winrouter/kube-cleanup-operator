@@ -1,6 +1,10 @@
 package controller
 
 import (
+	"context"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"log"
 	"time"
 
@@ -127,4 +131,65 @@ func deletePodHandler(c clientset.Interface, emitEventFunc func(types.Namespaced
 		}
 		return err
 	}
+}
+
+func isNeedProcessPod(pod corev1.Pod, kc *kubernetes.Clientset) bool {
+	podNamespacedName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+	if pod.OwnerReferences == nil || len(pod.OwnerReferences) == 0 {
+		// pod is not owner by controller, not process
+		return false
+	}
+	for _, ref := range pod.OwnerReferences {
+		log.Printf("pod %s owner %+v", podNamespacedName, ref)
+		if ref.Kind == "StatefulSet" && *ref.Controller == true {
+			// pod owner by statefulset
+			return true
+		}
+		if ref.Kind == "ReplicaSet" && *ref.Controller == true {
+			var hitPVC, hitNotPVC bool
+			for _, vol := range pod.Spec.Volumes {
+				if vol.CSI != nil {
+					// not support inline csi volume
+					hitNotPVC = true
+					continue
+				}
+				if vol.PersistentVolumeClaim != nil {
+					pvcName := vol.PersistentVolumeClaim
+					pvc, err := kc.CoreV1().PersistentVolumeClaims(pod.Namespace).
+						Get(context.TODO(), pvcName.ClaimName, metav1.GetOptions{})
+					if err != nil {
+						continue
+					}
+					scName := pvc.Spec.StorageClassName
+					sc, err := kc.StorageV1().StorageClasses().Get(context.TODO(), *scName, metav1.GetOptions{})
+					if isWhiteListStoragePro(sc.Provisioner) {
+						hitPVC = true
+					} else {
+						hitNotPVC = true
+					}
+				}
+			}
+
+			if hitPVC && !hitNotPVC {
+				// only pod owner by rs have volumes, which are all allowed force migrated
+				return true
+			}
+		}
+
+		// TODO: other controlled pod
+	}
+
+	return false
+}
+
+func isWhiteListStoragePro(provisioner string) bool {
+	allowed := []string {
+		"cinder.csi.openstack.org",
+	}
+	for _, item := range allowed {
+		if item == provisioner {
+			return true
+		}
+	}
+	return false
 }

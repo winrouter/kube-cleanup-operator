@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/klog/v2"
 	"log"
+	"math"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/metrics"
@@ -20,6 +23,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
+	storagev1 "k8s.io/api/storage/v1"
+	backoff "github.com/cenkalti/backoff/v4"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
 func ignoreNotFound(err error) error {
@@ -69,9 +77,13 @@ type Kleaner struct {
 	stopCh <-chan struct{}
 
 	taintEvictionQueue *TimedWorkerQueue
-	recorder              record.EventRecorder
+	recorder              *record.EventRecorder
 	cniConfig             CNIConfig
 	allowCSIDrivers       []string
+
+	// keeps a map from nodeName to all noExecute taints on that Node
+	taintedNodesLock sync.Mutex
+	taintedNodes     map[string][]corev1.Taint
 }
 
 // NewKleaner creates a new NewKleaner
@@ -132,6 +144,7 @@ func NewKleaner(ctx context.Context, kclient *kubernetes.Clientset, namespace st
 		ignoreOwnedByCronjob:  ignoreOwnedByCronjob,
 		labelSelector:         labelSelector,
 		recorder:              recorder,
+		taintedNodes:          make(map[string][]corev1.Taint),
 	}
 	jobInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		UpdateFunc: func(old, new interface{}) {
@@ -168,23 +181,10 @@ func NewKleaner(ctx context.Context, kclient *kubernetes.Clientset, namespace st
 	kleaner.podInformer = podInformer
 	kleaner.jobInformer = jobInformer
 
-	kleaner.taintEvictionQueue = CreateWorkerQueue(deletePodHandler(c, tm.emitPodDeletionEvent))
+	kleaner.taintEvictionQueue = CreateWorkerQueue(deletePodHandler(kleaner, kleaner.emitPodDeletionEvent))
 
 	return kleaner
 }
-
-func (c *Kleaner) emitPodDeletionEvent(nsName types.NamespacedName) {
-	if c.recorder == nil {
-		return
-	}
-	ref := &corev1.ObjectReference{
-		Kind:      "Pod",
-		Name:      nsName.Name,
-		Namespace: nsName.Namespace,
-	}
-	c.recorder.Eventf(ref, corev1.EventTypeNormal, "TaintManagerEviction", "Marking for deletion Pod %s", nsName.String())
-}
-
 
 func (c *Kleaner) periodicCacheCheck() {
 	ticker := time.NewTicker(2 * resyncPeriod)
@@ -247,9 +247,8 @@ func (c *Kleaner) Process(obj interface{}) {
 			return
 		}
 		// normal cleanup flow
-		if shouldCleanupNode(t) {
-			c.CleanupNode(t)
-		}
+		c.CleanupNode(t)
+
 
 	}
 }
@@ -292,6 +291,78 @@ func (c *Kleaner) DeletePod(pod *corev1.Pod, isForce bool) {
 	metrics.GetOrCreateCounter(metricName(podDeletedMetric, pod.Namespace)).Inc()
 }
 
+func (c *Kleaner) DeleteAttachVolume(pod *corev1.Pod) bool {
+	ns := pod.Namespace
+	nodeName := pod.Spec.NodeName
+
+	if nodeName == "" {
+		return true
+	}
+
+	volAttachMaps := make(map[string]storagev1.VolumeAttachment, 0)
+	volAttachments, err := c.kclient.StorageV1().VolumeAttachments().List(context.TODO(),
+		metav1.ListOptions{FieldSelector: "spec.nodeName=" + nodeName})
+	if err != nil {
+		return false
+	}
+
+	for _, attach := range volAttachments.Items {
+		//TODO: work for inline volume
+		volAttachMaps[*attach.Spec.Source.PersistentVolumeName] = attach
+	}
+
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim == nil {
+			continue
+		}
+
+		pvcName := volume.PersistentVolumeClaim.ClaimName
+		pvc, err := c.kclient.CoreV1().PersistentVolumeClaims(ns).Get(context.TODO(), pvcName, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		pvName := pvc.Spec.VolumeName
+
+		attach, ok := volAttachMaps[pvName]
+		if !ok {
+			continue
+		}
+
+		err = c.kclient.StorageV1().VolumeAttachments().Delete(context.TODO(), attach.Name, metav1.DeleteOptions{})
+		if err != nil {
+			return false
+		}
+
+		// TODO: wait the volumeattachment delete
+		b := backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 5)
+		checkDeleted := func() error {
+			_, err := c.kclient.StorageV1().VolumeAttachments().Get(context.TODO(), attach.Name, metav1.GetOptions{})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					return nil
+				}
+				return err
+			}
+			return fmt.Errorf("%s is not deleted", attach.Name)
+		}
+
+		if err = backoff.Retry(checkDeleted, b); err != nil {
+			return err
+		}
+
+		log.Printf("pvc %s on pod %s unattach from node %s", pvc.Name, pod.Name, nodeName)
+	}
+
+	return true
+}
+
+func (c *Kleaner) DeleteAttachNetwork(pod *corev1.Pod) bool {
+	if c.cniConfig.cniType != "calico" {
+		return true
+	}
+
+}
+
 
 func (c *Kleaner) CleanupNode(node *corev1.Node) {
 	if c.dryRun {
@@ -299,7 +370,148 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 		return
 	}
 
+	logger := klog.FromContext(context.TODO())
+	now := time.Now()
+
 	// get all pod -> filter pods -> add pods to
+	podList, err := c.kclient.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + node.Name})
+	if err != nil {
+		// print log
+		return
+	}
+
+	taints := getNoExecuteTaints(node.Spec.Taints)
+	if len(taints) == 0 {
+		c.taintedNodesLock.Lock()
+		if _, ok := c.taintedNodes[node.Name]; !ok {
+			c.taintedNodesLock.Unlock()
+			return
+		}
+		delete(c.taintedNodes, node.Name)
+		c.taintedNodesLock.Unlock()
+
+		logger.V(4).Info("All taints were removed from the node. Cancelling all evictions...", "node", klog.KObj(node))
+		for _, pod := range podList.Items {
+			c.cancelWorkWithEvent(logger, types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name})
+		}
+		return
+	}
+
+	func() {
+		c.taintedNodesLock.Lock()
+		defer c.taintedNodesLock.Unlock()
+		logger.V(4).Info("Updating known taints on node", "node", klog.KObj(node), "taints", taints)
+		if len(taints) == 0 {
+			delete(c.taintedNodes, node.Name)
+		} else {
+			c.taintedNodes[node.Name] = taints
+		}
+	}()
+
+	if len(podList.Items) == 0 {
+		return
+	}
+
+	if !shouldCleanupNode(node) {
+		return
+	}
+
+	for _, pod := range podList.Items {
+		podNamespacedName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+
+		if !isNeedProcessPod(pod, c.kclient) {
+			// print log
+			continue
+		}
+
+		tolerations := pod.Spec.Tolerations
+		allTolerated, usedTolerations := v1helper.GetMatchingTolerations(taints, tolerations)
+		if !allTolerated {
+			logger.V(2).Info("Not all taints are tolerated after update for pod on node", "pod", podNamespacedName.String(), "node", klog.KRef("", nodeName))
+			// We're canceling scheduled work (if any), as we're going to delete the Pod right away.
+			c.cancelWorkWithEvent(logger, podNamespacedName)
+			c.taintEvictionQueue.AddWork(context.TODO(), NewWorkArgs(podNamespacedName.Name, podNamespacedName.Namespace), time.Now(), time.Now())
+			continue
+		}
+
+		minTolerationTime := getMinTolerationTime(usedTolerations)
+		// getMinTolerationTime returns negative value to denote infinite toleration.
+		if minTolerationTime < 0 {
+			logger.V(4).Info("Current tolerations for pod tolerate forever, cancelling any scheduled deletion", "pod", podNamespacedName.String())
+			c.cancelWorkWithEvent(logger, podNamespacedName)
+			continue
+		}
+
+		startTime := now
+		triggerTime := startTime.Add(minTolerationTime)
+		scheduledEviction := c.taintEvictionQueue.GetWorkerUnsafe(podNamespacedName.String())
+		if scheduledEviction != nil {
+			startTime = scheduledEviction.CreatedAt
+			if startTime.Add(minTolerationTime).Before(triggerTime) {
+				continue
+			}
+			c.cancelWorkWithEvent(logger, podNamespacedName)
+		}
+		c.taintEvictionQueue.AddWork(context.TODO(), NewWorkArgs(podNamespacedName.Name, podNamespacedName.Namespace), startTime, triggerTime)
 
 
+	}
+}
+
+func (c *Kleaner) cancelWorkWithEvent(logger klog.Logger, nsName types.NamespacedName) {
+	if c.taintEvictionQueue.CancelWork(logger, nsName.String()) {
+		c.emitCancelPodDeletionEvent(nsName)
+	}
+}
+
+
+func (c *Kleaner) emitPodDeletionEvent(nsName types.NamespacedName) {
+	if c.recorder == nil {
+		return
+	}
+	ref := &corev1.ObjectReference{
+		Kind:      "Pod",
+		Name:      nsName.Name,
+		Namespace: nsName.Namespace,
+	}
+	c.recorder.Eventf(ref, corev1.EventTypeNormal, "TaintManagerEviction", "Marking for deletion Pod %s", nsName.String())
+}
+
+
+func (tc *Kleaner) emitCancelPodDeletionEvent(nsName types.NamespacedName) {
+	if tc.recorder == nil {
+		return
+	}
+	ref := &corev1.ObjectReference{
+		Kind:      "Pod",
+		Name:      nsName.Name,
+		Namespace: nsName.Namespace,
+	}
+	tc.recorder.Eventf(ref, corev1.EventTypeNormal, "TaintManagerEviction", "Cancelling deletion of Pod %s", nsName.String())
+}
+
+
+// getMinTolerationTime returns minimal toleration time from the given slice, or -1 if it's infinite.
+func getMinTolerationTime(tolerations []corev1.Toleration) time.Duration {
+	minTolerationTime := int64(math.MaxInt64)
+	if len(tolerations) == 0 {
+		return 0
+	}
+
+	for i := range tolerations {
+		if tolerations[i].TolerationSeconds != nil {
+			tolerationSeconds := *(tolerations[i].TolerationSeconds)
+			if tolerationSeconds <= 0 {
+				return 0
+			} else if tolerationSeconds < minTolerationTime {
+				minTolerationTime = tolerationSeconds
+			}
+		}
+	}
+
+	if minTolerationTime == int64(math.MaxInt64) {
+		return -1
+	}
+	return time.Duration(minTolerationTime) * time.Second
 }
