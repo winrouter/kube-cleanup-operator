@@ -28,6 +28,9 @@ import (
 	backoff "github.com/cenkalti/backoff/v4"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+
+	"github.com/projectcalico/calico/calicoctl/calicoctl/commands/clientmgr"
+	libipam "github.com/projectcalico/calico/libcalico-go/lib/ipam"
 )
 
 func ignoreNotFound(err error) error {
@@ -280,8 +283,14 @@ func (c *Kleaner) DeletePod(pod *corev1.Pod, isForce bool) {
 		po.GracePeriodSeconds = new(int64)
 
 		// TODO: force release pod and attachment pvc and cni
-	}
+		if deleted := c.DeleteAttachVolume(pod); !deleted {
+			return
+		}
 
+		if deleted := c.DeleteAttachNetwork(pod); !deleted {
+			return
+		}
+	}
 
 	if err := c.kclient.CoreV1().Pods(pod.Namespace).Delete(c.ctx, pod.Name, po); ignoreNotFound(err) != nil {
 		log.Printf("failed to delete pod '%s:%s': %v", pod.Namespace, pod.Name, err)
@@ -357,9 +366,45 @@ func (c *Kleaner) DeleteAttachVolume(pod *corev1.Pod) bool {
 }
 
 func (c *Kleaner) DeleteAttachNetwork(pod *corev1.Pod) bool {
-	if c.cniConfig.cniType != "calico" {
-		return true
+	if _, ok := pod.Annotations["cni.projectcalico.org/podIP"]; !ok {
+		return
 	}
+
+	// TODO: only support simple ip
+	ip := pod.Status.PodIP
+
+	cfg, err := clientmgr.LoadClientConfig("")
+	if err != nil {
+		return false
+	}
+
+	// Create a new backend client.
+	client, err := clientmgr.NewClientFromConfig(cfg)
+	if err != nil {
+		return false
+	}
+
+	ipamClient := client.IPAM()
+
+	opt := libipam.ReleaseOptions{Address: ip}
+
+	// Call ReleaseIPs releases the IP and returns an empty slice as unallocatedIPs if
+	// release was successful else it returns back the slice with the IP passed in.
+	unallocatedIPs, err := ipamClient.ReleaseIPs(context.TODO(), opt)
+	if err != nil {
+		log.Printf("ReleaseIps Error: %v\n", err)
+		return false
+	}
+
+	// Couldn't release the IP if the slice is not empty or IP might already be released/unassigned.
+	// This is not exactly an error, so not returning it to the caller.
+	if len(unallocatedIPs) != 0 {
+		log.Printf("IP address %s is not assigned\n", ip)
+		return false
+	}
+
+	// If unallocatedIPs slice is empty then IP was released Successfully.
+	fmt.Printf("Successfully released IP address %s\n", ip)
 
 }
 
