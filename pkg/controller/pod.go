@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -11,6 +13,11 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
+)
+
+const (
+	retries              = 5
+
 )
 
 func podRelatedToCronJob(pod *corev1.Pod, jobStore cache.Store) bool {
@@ -113,23 +120,33 @@ func podFinishTime(podObj *corev1.Pod) time.Time {
 }
 
 
-func deletePodHandler(c clientset.Interface, emitEventFunc func(types.NamespacedName)) func(ctx context.Context, args *WorkArgs) error {
+func deletePodHandler(c *Kleaner, emitEventFunc func(types.NamespacedName)) func(ctx context.Context, args *WorkArgs) error {
 	return func(ctx context.Context, args *WorkArgs) error {
 		ns := args.NamespacedName.Namespace
 		name := args.NamespacedName.Name
-		klog.FromContext(ctx).Info("NoExecuteTaintManager is deleting pod", "pod", args.NamespacedName.String())
+		log.Printf("CleanupManager is deleting pod %s\n", args.NamespacedName.String())
+
+		var err error
+		pod, err := c.kclient.CoreV1().Pods(ns).Get(context.TODO(), name, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
 		if emitEventFunc != nil {
 			emitEventFunc(args.NamespacedName)
 		}
-		var err error
+
 		for i := 0; i < retries; i++ {
-			err = addConditionAndDeletePod(ctx, c, name, ns)
-			if err == nil {
-				break
+			log.Printf("retry to delete pod %s/%s\n", pod.Namespace, pod.Name)
+			isDeleted := c.DeletePod(pod, true)
+			if isDeleted {
+				return nil
 			}
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
-		return err
+		return fmt.Errorf("failed to delete pod %s/%s", pod.Namespace, pod.Name)
 	}
 }
 
@@ -162,7 +179,7 @@ func isNeedProcessPod(pod corev1.Pod, kc *kubernetes.Clientset) bool {
 					}
 					scName := pvc.Spec.StorageClassName
 					sc, err := kc.StorageV1().StorageClasses().Get(context.TODO(), *scName, metav1.GetOptions{})
-					if isWhiteListStoragePro(sc.Provisioner) {
+					if (err == nil && isWhiteListStoragePro(sc.Provisioner)) || isWhiteListFromPvcAnns(pvc) {
 						hitPVC = true
 					} else {
 						hitNotPVC = true
@@ -182,10 +199,32 @@ func isNeedProcessPod(pod corev1.Pod, kc *kubernetes.Clientset) bool {
 	return false
 }
 
+var allowed []string = []string{"cinder.csi.openstack.org"}
+
 func isWhiteListStoragePro(provisioner string) bool {
-	allowed := []string {
-		"cinder.csi.openstack.org",
+
+	for _, item := range allowed {
+		if item == provisioner {
+			return true
+		}
 	}
+	return false
+}
+
+func isWhiteListFromPvcAnns(pvc *corev1.PersistentVolumeClaim) bool {
+	var provisioner string
+	if _, ok := pvc.Annotations["volume.beta.kubernetes.io/storage-provisioner"]; ok {
+		provisioner = pvc.Annotations["volume.beta.kubernetes.io/storage-provisioner"]
+	}
+
+	if _, ok := pvc.Annotations["volume.kubernetes.io/storage-provisioner"]; ok {
+		provisioner = pvc.Annotations["volume.kubernetes.io/storage-provisioner"]
+	}
+
+	if provisioner == "" {
+		return false
+	}
+
 	for _, item := range allowed {
 		if item == provisioner {
 			return true

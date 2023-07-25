@@ -2,6 +2,7 @@ package controller
 
 import (
 	"log"
+	"reflect"
 
 	corev1 "k8s.io/api/core/v1"
 )
@@ -21,6 +22,19 @@ func getNodeCondStatus(conditions []corev1.NodeCondition, condType corev1.NodeCo
 
 func diffNodeStatusReady(oldNode, newNode *corev1.Node) bool {
 	if getNodeCondStatus(oldNode.Status.Conditions, corev1.NodeReady) != getNodeCondStatus(newNode.Status.Conditions, corev1.NodeReady) {
+		log.Printf("oldNode ready:%v -> newNode ready:%v\n",
+			getNodeCondStatus(oldNode.Status.Conditions, corev1.NodeReady),
+			getNodeCondStatus(newNode.Status.Conditions, corev1.NodeReady))
+		return true
+	}
+
+	if !reflect.DeepEqual(oldNode.Spec.Taints, newNode.Spec.Taints) {
+		log.Printf("oldTaint:%+v, newTaint:%+v\n", oldNode.Status.Conditions, newNode.Status.Conditions)
+		return true
+	}
+
+	if !reflect.DeepEqual(oldNode.Annotations, newNode.Annotations) {
+		log.Printf("oldAnnots:%+v, newAnnota:%+v\n", oldNode.Annotations, newNode.Annotations)
 		return true
 	}
 	return false
@@ -28,7 +42,7 @@ func diffNodeStatusReady(oldNode, newNode *corev1.Node) bool {
 
 func shouldCleanupNode(node *corev1.Node) bool {
 	status := getNodeCondStatus(node.Status.Conditions, corev1.NodeReady)
-	if status != corev1.ConditionFalse {
+	if status == corev1.ConditionTrue {
 		log.Printf("node %s is ready, ignore\n", node.Name)
 		return false
 	}
