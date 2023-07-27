@@ -124,6 +124,7 @@ func deletePodHandler(c *Kleaner, emitEventFunc func(types.NamespacedName)) func
 	return func(ctx context.Context, args *WorkArgs) error {
 		ns := args.NamespacedName.Namespace
 		name := args.NamespacedName.Name
+		nodeName := args.NodeName
 		log.Printf("CleanupManager is deleting pod %s\n", args.NamespacedName.String())
 
 		var err error
@@ -134,6 +135,11 @@ func deletePodHandler(c *Kleaner, emitEventFunc func(types.NamespacedName)) func
 			}
 			return err
 		}
+
+		if pod.Spec.NodeName != nodeName {
+			return nil
+		}
+
 		if emitEventFunc != nil {
 			emitEventFunc(args.NamespacedName)
 		}
@@ -144,7 +150,7 @@ func deletePodHandler(c *Kleaner, emitEventFunc func(types.NamespacedName)) func
 			if isDeleted {
 				return nil
 			}
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(3 * time.Second)
 		}
 		return fmt.Errorf("failed to delete pod %s/%s", pod.Namespace, pod.Name)
 	}

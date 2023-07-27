@@ -15,6 +15,7 @@ import (
 // WorkArgs keeps arguments that will be passed to the function executed by the worker.
 type WorkArgs struct {
 	NamespacedName types.NamespacedName
+	NodeName string
 }
 
 // KeyFromWorkArgs creates a key for the given `WorkArgs`
@@ -23,8 +24,9 @@ func (w *WorkArgs) KeyFromWorkArgs() string {
 }
 
 // NewWorkArgs is a helper function to create new `WorkArgs`
-func NewWorkArgs(name, namespace string) *WorkArgs {
-	return &WorkArgs{types.NamespacedName{Namespace: namespace, Name: name}}
+func NewWorkArgs(name, namespace string, nodeName string) *WorkArgs {
+	return &WorkArgs{types.NamespacedName{Namespace: namespace, Name: name},
+		nodeName}
 }
 
 // TimedWorker is a responsible for executing a function no earlier than at FireAt time.

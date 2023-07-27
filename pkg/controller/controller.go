@@ -364,7 +364,7 @@ func (c *Kleaner) DeleteAttachVolume(pod *corev1.Pod) bool {
 		}
 
 		// TODO: wait the volumeattachment delete
-		b := backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 5)
+		b := backoff.WithMaxRetries(getUnattachBackoff(), 5)
 		checkDeleted := func() error {
 			_, err := c.kclient.StorageV1().VolumeAttachments().Get(context.TODO(), attach.Name, metav1.GetOptions{})
 			if err != nil {
@@ -395,7 +395,7 @@ func (c *Kleaner) DeleteAttachNetwork(pod *corev1.Pod) bool {
 	if _, ok := pod.Annotations["cni.projectcalico.org/podIP"]; !ok {
 		return true
 	}
-
+	// TODO: check ip ownered by the pod
 	// TODO: only support simple ip
 	ip := pod.Status.PodIP
 
@@ -456,9 +456,10 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 	debugPodList(podList.Items)
 
 	taints := getNoExecuteTaints(node.Spec.Taints)
+	isForceFlag := isExistForceAnn(node.Annotations)
 	debugTaints(taints)
 	// TODO: force annotation missing need to cacel work task
-	if len(taints) == 0 {
+	if len(taints) == 0 || !isForceFlag {
 		log.Printf("not found noExecuteTaint\n")
 		c.taintedNodesLock.Lock()
 		if _, ok := c.taintedNodes[node.Name]; !ok {
@@ -499,6 +500,7 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 
 	for _, pod := range podList.Items {
 		podNamespacedName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+		nodeName := pod.Spec.NodeName
 		log.Printf("check for pod %s\n", podNamespacedName)
 
 		if !isNeedProcessPod(pod, c.kclient) {
@@ -516,7 +518,7 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 				"pod", podNamespacedName.String(), "node", klog.KRef("", node.Name))
 			// We're canceling scheduled work (if any), as we're going to delete the Pod right away.
 			c.cancelWorkWithEvent(logger, podNamespacedName)
-			c.taintEvictionQueue.AddWork(context.TODO(), NewWorkArgs(podNamespacedName.Name, podNamespacedName.Namespace), time.Now(), time.Now())
+			c.taintEvictionQueue.AddWork(context.TODO(), NewWorkArgs(podNamespacedName.Name, podNamespacedName.Namespace, nodeName), time.Now(), time.Now())
 			continue
 		}
 
@@ -546,7 +548,7 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 		}
 		log.Printf("add work to evictionQueue %s %s %s %s %s %s\n", "pod", podNamespacedName,
 			"startTime", startTime, "triggerTime", triggerTime)
-		c.taintEvictionQueue.AddWork(context.TODO(), NewWorkArgs(podNamespacedName.Name, podNamespacedName.Namespace), startTime, triggerTime)
+		c.taintEvictionQueue.AddWork(context.TODO(), NewWorkArgs(podNamespacedName.Name, podNamespacedName.Namespace, nodeName), startTime, triggerTime)
 	}
 }
 
@@ -566,7 +568,7 @@ func (c *Kleaner) emitPodDeletionEvent(nsName types.NamespacedName) {
 		Name:      nsName.Name,
 		Namespace: nsName.Namespace,
 	}
-	c.recorder.Eventf(ref, corev1.EventTypeNormal, "TaintManagerEviction", "Marking for deletion Pod %s", nsName.String())
+	c.recorder.Eventf(ref, corev1.EventTypeNormal, "FailoverManagerEviction", "Marking for deletion Pod %s", nsName.String())
 }
 
 
@@ -579,7 +581,7 @@ func (c *Kleaner) emitCancelPodDeletionEvent(nsName types.NamespacedName) {
 		Name:      nsName.Name,
 		Namespace: nsName.Namespace,
 	}
-	c.recorder.Eventf(ref, corev1.EventTypeNormal, "TaintManagerEviction", "Cancelling deletion of Pod %s", nsName.String())
+	c.recorder.Eventf(ref, corev1.EventTypeNormal, "FailoverManagerEviction", "Cancelling deletion of Pod %s", nsName.String())
 }
 
 
@@ -620,4 +622,24 @@ func debugTaints(t []corev1.Taint) {
 		log.Printf("\t %v  %v\n", ta, ta.TimeAdded)
 	}
 
+}
+
+func getUnattachBackoff() *backoff.ExponentialBackOff {
+	bf := backoff.NewExponentialBackOff()
+	bf.InitialInterval = 3*time.Second
+	bf.RandomizationFactor = 0.1
+	bf.Multiplier = 2.0
+	bf.MaxInterval = 2*time.Minute
+	bf.MaxElapsedTime = 15*time.Minute
+	bf.Reset()
+	return bf
+}
+
+func isExistForceAnn(anns map[string]string) bool {
+	for key, _ := range anns {
+		if key == ForceEvict {
+			return true
+		}
+	}
+	return false
 }
