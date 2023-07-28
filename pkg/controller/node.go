@@ -104,3 +104,29 @@ func getNoExecuteTaints(taints []corev1.Taint) []corev1.Taint {
 }
 
 
+// GetMatchingTolerations returns true and list of Tolerations matching all Taints if all are tolerated, or false otherwise.
+func GetMatchingTolerations(taints []corev1.Taint, tolerations []corev1.Toleration) (bool, []corev1.Toleration, []corev1.Taint) {
+	if len(taints) == 0{
+		return true, []corev1.Toleration{}, []corev1.Taint{}
+	}
+	if len(tolerations) == 0 && len(taints) > 0 {
+		return false, []corev1.Toleration{}, taints
+	}
+	result := []corev1.Toleration{}
+	resultTaints := []corev1.Taint{}
+	for i := range taints {
+		tolerated := false
+		for j := range tolerations {
+			if tolerations[j].ToleratesTaint(&taints[i]) {
+				result = append(result, tolerations[j])
+				resultTaints = append(resultTaints, taints[i])
+				tolerated = true
+				break
+			}
+		}
+		if !tolerated {
+			return false, []corev1.Toleration{}, taints
+		}
+	}
+	return true, result, resultTaints
+}

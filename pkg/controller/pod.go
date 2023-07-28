@@ -141,6 +141,7 @@ func deletePodHandler(c *Kleaner, emitEventFunc func(types.NamespacedName)) func
 		}
 
 		if emitEventFunc != nil {
+			log.Printf("send delete event\n")
 			emitEventFunc(args.NamespacedName)
 		}
 
@@ -158,45 +159,57 @@ func deletePodHandler(c *Kleaner, emitEventFunc func(types.NamespacedName)) func
 
 func isNeedProcessPod(pod corev1.Pod, kc *kubernetes.Clientset) bool {
 	podNamespacedName := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+
+	calcVolume := func(pod corev1.Pod) (bool, bool) {
+		var hitPVC, hitNotSupPVC bool
+		for _, vol := range pod.Spec.Volumes {
+			if vol.CSI != nil {
+				// not support inline csi volume
+				hitNotSupPVC = true
+				continue
+			}
+			if vol.PersistentVolumeClaim != nil {
+				pvcName := vol.PersistentVolumeClaim
+				pvc, err := kc.CoreV1().PersistentVolumeClaims(pod.Namespace).
+					Get(context.TODO(), pvcName.ClaimName, metav1.GetOptions{})
+				if err != nil {
+					hitNotSupPVC = true
+					continue
+				}
+				scName := pvc.Spec.StorageClassName
+				sc, err := kc.StorageV1().StorageClasses().Get(context.TODO(), *scName, metav1.GetOptions{})
+				if (err == nil && isWhiteListStoragePro(sc.Provisioner)) || isWhiteListFromPvcAnns(pvc) {
+					hitPVC = true
+				} else {
+					hitNotSupPVC = true
+				}
+			}
+		}
+		return hitPVC, hitNotSupPVC
+	}
+
 	if pod.OwnerReferences == nil || len(pod.OwnerReferences) == 0 {
 		// pod is not owner by controller, not process
 		return false
 	}
+
 	for _, ref := range pod.OwnerReferences {
 		log.Printf("pod %s owner %+v", podNamespacedName, ref)
 		if ref.Kind == "StatefulSet" && *ref.Controller == true {
 			// pod owner by statefulset
+			_, hitNotPVC := calcVolume(pod)
+			if hitNotPVC {
+				return false
+			}
 			return true
 		}
 		if ref.Kind == "ReplicaSet" && *ref.Controller == true {
-			var hitPVC, hitNotPVC bool
-			for _, vol := range pod.Spec.Volumes {
-				if vol.CSI != nil {
-					// not support inline csi volume
-					hitNotPVC = true
-					continue
-				}
-				if vol.PersistentVolumeClaim != nil {
-					pvcName := vol.PersistentVolumeClaim
-					pvc, err := kc.CoreV1().PersistentVolumeClaims(pod.Namespace).
-						Get(context.TODO(), pvcName.ClaimName, metav1.GetOptions{})
-					if err != nil {
-						continue
-					}
-					scName := pvc.Spec.StorageClassName
-					sc, err := kc.StorageV1().StorageClasses().Get(context.TODO(), *scName, metav1.GetOptions{})
-					if (err == nil && isWhiteListStoragePro(sc.Provisioner)) || isWhiteListFromPvcAnns(pvc) {
-						hitPVC = true
-					} else {
-						hitNotPVC = true
-					}
-				}
-			}
-
+			hitPVC, hitNotPVC := calcVolume(pod)
 			if hitPVC && !hitNotPVC {
 				// only pod owner by rs have volumes, which are all allowed force migrated
 				return true
 			}
+			return false
 		}
 
 		// TODO: other controlled pod

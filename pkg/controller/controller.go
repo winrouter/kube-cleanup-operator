@@ -17,6 +17,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,9 +26,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
-	v1helper "k8s.io/kubernetes/pkg/apis/core/v1/helper"
-
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	typedcorev1  "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	"github.com/projectcalico/calico/libcalico-go/lib/apiconfig"
 	libcalicoclient "github.com/projectcalico/calico/libcalico-go/lib/clientv3"
@@ -132,7 +131,9 @@ func NewKleaner(ctx context.Context, kclient *kubernetes.Clientset, namespace st
 
 
 	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{kclient.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "cleanup-controller"})
+
 
 	kleaner := &Kleaner{
 		dryRun:                dryRun,
@@ -512,7 +513,7 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 		log.Printf("start to deal with pod %s\n", podNamespacedName)
 
 		tolerations := pod.Spec.Tolerations
-		allTolerated, usedTolerations := v1helper.GetMatchingTolerations(taints, tolerations)
+		allTolerated, usedTolerations, usedTaints := GetMatchingTolerations(taints, tolerations)
 		if !allTolerated {
 			log.Printf("Not all taints are tolerated after update for pod on node %s %s %s %s\n",
 				"pod", podNamespacedName.String(), "node", klog.KRef("", node.Name))
@@ -522,7 +523,8 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 			continue
 		}
 
-		minTolerationTime := getMinTolerationTime(usedTolerations)
+		startTime := now
+		minTolerationTime, triggerTime := getMinTolerationTime(usedTolerations, usedTaints, now)
 		log.Printf("get minTolerationTime %s %s\n", "time", minTolerationTime)
 		// getMinTolerationTime returns negative value to denote infinite toleration.
 		if minTolerationTime < 0 {
@@ -533,8 +535,11 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 		}
 
 		// TODO: cleanup-manager reboot, and the time is going pod teminating , always need to wait 5min
-		startTime := now
-		triggerTime := startTime.Add(minTolerationTime)
+
+		if triggerTime.Before(startTime) {
+			triggerTime = startTime
+		}
+		// triggerTime := startTime.Add(minTolerationTime)
 		scheduledEviction := c.taintEvictionQueue.GetWorkerUnsafe(podNamespacedName.String())
 		if scheduledEviction != nil {
 			log.Printf("found in scheduledEviction %s %s\n", "pod", podNamespacedName)
@@ -554,6 +559,7 @@ func (c *Kleaner) CleanupNode(node *corev1.Node) {
 
 func (c *Kleaner) cancelWorkWithEvent(logger klog.Logger, nsName types.NamespacedName) {
 	if c.taintEvictionQueue.CancelWork(logger, nsName.String()) {
+		log.Printf("send cancel work\n")
 		c.emitCancelPodDeletionEvent(nsName)
 	}
 }
@@ -568,7 +574,8 @@ func (c *Kleaner) emitPodDeletionEvent(nsName types.NamespacedName) {
 		Name:      nsName.Name,
 		Namespace: nsName.Namespace,
 	}
-	c.recorder.Eventf(ref, corev1.EventTypeNormal, "FailoverManagerEviction", "Marking for deletion Pod %s", nsName.String())
+	log.Printf("FailoverManagerEviction send event ....................")
+	c.recorder.Eventf(ref, corev1.EventTypeNormal, "FailoverManagerEviction", "Force marking for deletion Pod %s", nsName.String())
 }
 
 
@@ -581,32 +588,48 @@ func (c *Kleaner) emitCancelPodDeletionEvent(nsName types.NamespacedName) {
 		Name:      nsName.Name,
 		Namespace: nsName.Namespace,
 	}
-	c.recorder.Eventf(ref, corev1.EventTypeNormal, "FailoverManagerEviction", "Cancelling deletion of Pod %s", nsName.String())
+	log.Printf("FailoverManagerEviction send cacel event ....................")
+	c.recorder.Eventf(ref, corev1.EventTypeNormal, "FailoverManagerEviction", "Force cancelling deletion of Pod %s", nsName.String())
 }
 
 
 // getMinTolerationTime returns minimal toleration time from the given slice, or -1 if it's infinite.
-func getMinTolerationTime(tolerations []corev1.Toleration) time.Duration {
+func getMinTolerationTime(tolerations []corev1.Toleration, taints []corev1.Taint, now time.Time) (time.Duration, time.Time) {
 	minTolerationTime := int64(math.MaxInt64)
+
 	if len(tolerations) == 0 {
-		return 0
+		return 0, now
 	}
 
+	for _, tol := range tolerations {
+		log.Printf("%s  %v\n", tol.Key, *tol.TolerationSeconds)
+	}
+
+	maxTimeTaint := now.Add(10 * time.Minute)
+	minTime := maxTimeTaint
 	for i := range tolerations {
+
 		if tolerations[i].TolerationSeconds != nil {
 			tolerationSeconds := *(tolerations[i].TolerationSeconds)
+			taintAdded := taints[i].TimeAdded
+			log.Printf("taintAdded %v tolerationSeconds %v\n", taintAdded, tolerationSeconds)
 			if tolerationSeconds <= 0 {
-				return 0
-			} else if tolerationSeconds < minTolerationTime {
-				minTolerationTime = tolerationSeconds
+				return 0, now
+			} else if taintAdded.Add(time.Duration(tolerationSeconds) * time.Second).Before(minTime) {
+				minTolerationTime = tolerationSeconds - int64(now.Sub(taintAdded.Time).Seconds())
+				if minTolerationTime < 0 {
+					return 0, now
+				}
+				minTime = taintAdded.Add(time.Duration(tolerationSeconds) * time.Second)
+				log.Printf("update taint %v  %v\n", minTolerationTime, minTime)
 			}
 		}
 	}
 
-	if minTolerationTime == int64(math.MaxInt64) {
-		return -1
+	if minTime == maxTimeTaint {
+		return -1, now
 	}
-	return time.Duration(minTolerationTime) * time.Second
+	return time.Duration(minTolerationTime) * time.Second, minTime
 }
 
 func debugPodList(pods []corev1.Pod) {
